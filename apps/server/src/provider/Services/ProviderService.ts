@@ -75,6 +75,14 @@ export interface ProviderSessionStartOutcomeOptions {
    * provider has accepted the bootstrap turn.
    */
   readonly registerPriorTranscriptBootstrapOnFreshStart?: boolean;
+  /**
+   * The caller moves the thread to this provider on purpose (a stored provider
+   * rebind). A persisted binding owned by another provider driver gives up its
+   * native continuation, like the reset a handoff requests first, and the
+   * fresh session carries the prior transcript instead. A binding of the same
+   * driver stays protected: another home or account still cannot take it over.
+   */
+  readonly abandonOtherProviderContinuation?: boolean;
 }
 
 export interface PersistedProviderSessionProfile {
@@ -121,6 +129,11 @@ export interface ProviderServiceShape {
   /** Mark a persisted prior-transcript bootstrap as accepted by the provider. */
   readonly completePriorTranscriptBootstrap?: (input: {
     readonly threadId: ThreadId;
+    /**
+     * Pin terminal-confirmed acceptance to its runtime. Explicit discard and
+     * immediate Codex acknowledgement do not supply a terminal generation.
+     */
+    readonly expectedLifecycleGeneration?: string;
   }) => Effect.Effect<void, ProviderServiceError>;
 
   /**
