@@ -62,6 +62,7 @@ import { closeDockTerminalPane } from "~/hooks/useTerminalSurfaceController";
 import { useThreadRecap } from "~/hooks/useThreadRecap";
 import { SINGLE_CHAT_PANE_SCOPE_ID } from "~/lib/chatPaneScope";
 import { formatComposerMentionToken } from "~/lib/composerMentions";
+import { hasActiveComposerSend } from "~/lib/composerSendOwnership";
 import {
   GIT_WORKING_TREE_DIFF_LIVE_REFETCH_INTERVAL_MS,
   gitBranchesQueryOptions,
@@ -82,6 +83,7 @@ import { findProviderStatus, resolveVoiceTranscriptionTarget } from "~/lib/provi
 import { resolveProviderInstanceLabel } from "~/lib/providerInstancePresentation";
 import { holdQueuedComposerTurnsForStop } from "~/lib/queuedComposerDrain";
 import { resolveAuxiliaryTextGenerationSelection } from "~/lib/textGenerationCapabilities";
+import { resolveInheritedThreadContext } from "~/lib/threadBootstrap";
 import { cn, isMacNavigatorPlatform, newCommandId, newThreadId, randomUUID } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
 import { dispatchThreadSnoozedUntil, resolveSnoozeDeadline } from "~/lib/threadSnooze";
@@ -5523,6 +5525,30 @@ export default function ChatView({
   const onRunProjectScriptFromHeader = useStableCallback((script: ProjectScript) => {
     void runProjectScript(script);
   });
+  // Header "New thread": mints a thread in the active workspace (same branch/worktree/env),
+  // falling back to the project when there is no server/draft thread yet.
+  const onNewThreadFromHeader = useStableCallback(() => {
+    const targetProjectId = activeProject?.id ?? activeThread?.projectId ?? null;
+    if (!targetProjectId) return;
+    // The shared New thread path reopens a pending draft before creating a chat. Keep
+    // that draft's workspace instead of retargeting its unsent text to the viewed chat.
+    const pendingProjectDraft = useComposerDraftStore
+      .getState()
+      .getDraftThreadByProjectId(targetProjectId);
+    void handleNewThread(
+      targetProjectId,
+      resolveInheritedThreadContext({
+        activeThread,
+        activeDraftThread:
+          draftThread ??
+          (pendingProjectDraft &&
+          pendingProjectDraft.isTemporary !== true &&
+          !hasActiveComposerSend(pendingProjectDraft.threadId)
+            ? pendingProjectDraft
+            : null),
+      }),
+    );
+  });
   const dismissActiveThreadError = useCallback(() => {
     if (!activeThread) return;
     setThreadError(activeThread.id, null);
@@ -6070,6 +6096,17 @@ export default function ChatView({
     onRenamePinnedMessage: handleRenamePinnedMessage,
     onNotesChange: handleNotesChange,
     onOpenEditorView: viewModeAction?.onClick ?? null,
+    ...(activeProjectScripts !== undefined
+      ? {
+          projectActions: {
+            scripts: activeProjectScripts,
+            onRunScript: onRunProjectScriptFromHeader,
+            onAddScript: saveProjectScript,
+            onUpdateScript: updateProjectScript,
+            onDeleteScript: deleteProjectScript,
+          },
+        }
+      : {}),
     onClose: closeEnvironmentPanelAfterAction,
     onRegisterCommitAndPushTrigger,
   };
@@ -6702,6 +6739,11 @@ export default function ChatView({
                     keybindings={keybindings}
                     closeActiveTabRef={closeActiveThreadTabRef}
                     onRenameActiveThread={() => setRenameDialogOpen(true)}
+                    onNewThread={
+                      activeProjectScripts !== undefined && !isCenteredEmptyLanding
+                        ? onNewThreadFromHeader
+                        : null
+                    }
                   />
                 ),
               }
@@ -6723,7 +6765,8 @@ export default function ChatView({
           handoffDisabled={handoffDisabled}
           handoffActionTargets={handoffTargets}
           continueHandoffActionTargets={continueHandoffTargets}
-          showHandoffAction={handoffAvailability.providerHandoff}
+          showHandoffAction={handoffAvailability.providerHandoff && settings.showHeaderHandoff}
+          showHeaderActions={settings.showHeaderActions}
           gitCwd={threadWorkspaceCwd}
           diffTotals={repoDiffTotals}
           showGitActions={showGitActions && !isEditorRail}
