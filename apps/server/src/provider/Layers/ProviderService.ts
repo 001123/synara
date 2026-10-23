@@ -2709,6 +2709,23 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         return matches.find((match) => match !== null) ?? null;
       });
 
+    // Only adapters with a separate retained probe keep a context that
+    // hasSession reports inactive; the others are found by findLiveSession.
+    const findRetainedAdapter = (threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const matches = yield* Effect.forEach(
+          adapters,
+          (adapter) =>
+            adapter.hasRetainedSession
+              ? adapter
+                  .hasRetainedSession(threadId)
+                  .pipe(Effect.map((retained) => (retained ? adapter : null)))
+              : Effect.succeed(null),
+          { concurrency: "unbounded" },
+        );
+        return matches.find((match) => match !== null) ?? null;
+      });
+
     const stopStaleSessionsForThread = (input: {
       readonly threadId: ThreadId;
       readonly provider: ProviderKind;
@@ -3349,7 +3366,13 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               }
 
               const previousAdapter = yield* getAdapterForBinding(persistedBinding);
-              if (!(yield* previousAdapter.hasSession(threadId))) {
+              // A retained but inactive context still needs cleanup, but only a
+              // live source is restored when the replacement fails.
+              const previousSessionLive = yield* previousAdapter.hasSession(threadId);
+              const previousSessionRetained = previousAdapter.hasRetainedSession
+                ? yield* previousAdapter.hasRetainedSession(threadId)
+                : previousSessionLive;
+              if (!previousSessionRetained) {
                 return yield* startAndPersistReplacement;
               }
 
@@ -3396,6 +3419,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                         if (replacementStarted) {
                           yield* adapter.stopSession(threadId);
                         }
+                        if (!previousSessionLive) return;
                         const restored = yield* previousAdapter.startSession({
                           threadId,
                           provider: persistedBinding.provider,
@@ -4632,13 +4656,18 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   : Effect.fail(error),
               ),
             );
-            if (routed === null) return;
-            hasRoutableBinding = true;
+            // A Pi startup that fails after registering its context can retain
+            // that context with no binding while hasSession reports it inactive.
+            // Routing stays on hasSession; this cleanup falls back to the
+            // retained probe so a second teardown failure still fails the stop.
+            const adapter = routed?.adapter ?? (yield* findRetainedAdapter(input.threadId));
+            if (adapter === null) return;
+            hasRoutableBinding = routed !== null;
             // Start the physical cleanup under the old generation, alongside
             // its durable drain. Neither may wait for the other to begin, and
             // one failure must not cancel the remaining cleanup/drain work.
             yield* settleConcurrentTeardowns(
-              [routed.adapter.stopSession(input.threadId), flushRuntimeText(input.threadId)],
+              [adapter.stopSession(input.threadId), flushRuntimeText(input.threadId)],
               (teardown) => teardown,
             );
           }),
@@ -4737,14 +4766,20 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               if (!binding || !isExpectedIdleStopCurrent()) return;
               const adapter = yield* getAdapterForBinding(binding);
               const hasActiveSession = yield* adapter.hasSession(input.threadId);
+              // A context retained by a failed stop is not live, but its cursor
+              // can be newer than a binding write that has not landed yet.
+              const hasRetainedSession = adapter.hasRetainedSession
+                ? yield* adapter.hasRetainedSession(input.threadId)
+                : hasActiveSession;
               let resumeCursor = binding.resumeCursor;
               if (!isExpectedIdleStopCurrent()) return;
-              if (hasActiveSession) {
+              if (hasRetainedSession) {
                 const activeSessions = yield* adapter.listSessions();
                 const activeSession = activeSessions.find(
                   (session) => session.threadId === input.threadId,
                 );
                 if (
+                  hasActiveSession &&
                   rawInput.onlyIfIdleSince !== undefined &&
                   (!activeSession ||
                     activeSession.status === "connecting" ||
@@ -4931,7 +4966,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               const adapter = yield* getAdapterForBinding(binding);
               const hasActiveSession = yield* adapter.hasSession(input.threadId);
               const preserveActive = hasActiveSession && input.preserveActiveRuntime === true;
-              if (hasActiveSession && !preserveActive) {
+              const hasRetainedSession = adapter.hasRetainedSession
+                ? yield* adapter.hasRetainedSession(input.threadId)
+                : hasActiveSession;
+              if (hasRetainedSession && !preserveActive) {
                 yield* adapter.stopSession(input.threadId);
               }
               if (!preserveActive) {
@@ -4972,7 +5010,16 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     const listSessions: ProviderServiceShape["listSessions"] = () =>
       Effect.gen(function* () {
         const activeSessions = (yield* Effect.forEach(adapters, (adapter) =>
-          adapter.listSessions(),
+          adapter.listSessions().pipe(
+            Effect.flatMap((sessions) =>
+              // An adapter with a retained probe keeps a context after a failed
+              // stop for cleanup retries. That context is not live, so it stays
+              // out of the listing that decides liveness and holds queued turns.
+              adapter.hasRetainedSession
+                ? Effect.filter(sessions, (session) => adapter.hasSession(session.threadId))
+                : Effect.succeed(sessions),
+            ),
+          ),
         )).flatMap((sessions) => sessions);
         // One `list()` query: `listBindings` already returns every persisted
         // binding (skipping rows with unknown providers, exactly as the per-thread
@@ -5017,6 +5064,20 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           return Object.assign({}, session, overrides);
         });
       });
+
+    const listRetainedSessions: NonNullable<ProviderServiceShape["listRetainedSessions"]> = () =>
+      Effect.forEach(adapters, (adapter) =>
+        // The contexts the listing above leaves out. Their process may still
+        // be running, so safety checks such as the checkpoint revert guard
+        // read them here.
+        adapter.hasRetainedSession
+          ? Effect.flatMap(adapter.listSessions(), (sessions) =>
+              Effect.filter(sessions, (session) =>
+                adapter.hasSession(session.threadId).pipe(Effect.map((live) => !live)),
+              ),
+            )
+          : Effect.succeed<ReadonlyArray<ProviderSession>>([]),
+      ).pipe(Effect.map((sessions) => sessions.flatMap((entries) => entries)));
 
     const startClaudeCompaction: NonNullable<ProviderServiceShape["startClaudeCompaction"]> = (
       input,
@@ -5311,6 +5372,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       hasLiveRuntimeTasks,
       clearSessionResumeCursor,
       listSessions,
+      listRetainedSessions,
       getCapabilities,
       getClaudeCacheObservation,
       startClaudeCompaction,

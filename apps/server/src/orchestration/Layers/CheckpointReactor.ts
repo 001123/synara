@@ -1295,21 +1295,37 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       sessionThreadId === event.payload.threadId
         ? [event.payload.threadId]
         : [event.payload.threadId, sessionThreadId];
-    const [commandReadModel, pendingTurnStarts, providerSessions] = yield* Effect.all([
+    const [commandReadModel, pendingTurnStarts, [live, retained]] = yield* Effect.all([
       orchestrationEngine.getReadModel(),
       Effect.forEach(relevantThreadIds, (threadId) =>
         projectionTurnRepository.getPendingTurnStartByThreadId({ threadId }),
       ),
-      providerService.listSessions(),
+      // A context kept after a failed stop is out of the live listing, so
+      // routing and queued turns skip it, but its process may still be
+      // writing to this worktree. The guards below read it as well.
+      Effect.all([
+        providerService.listSessions(),
+        providerService.listRetainedSessions?.() ??
+          Effect.succeed<ReadonlyArray<ProviderSession>>([]),
+      ]),
     ]);
+    const providerSessions = [...live, ...retained];
+    // A retained context keeps whatever status its adapter reports, Pi says
+    // closed, so its turn id alone marks a turn in flight.
+    const sessionHasInFlightTurn = (session: ProviderSession | undefined) =>
+      providerSessionHasInFlightTurn(session) ||
+      (session?.activeTurnId != null && retained.includes(session));
+    // A thread can list a live session and a retained context at once, so a
+    // turn on any of its sessions counts.
+    const sessionsWithInFlightTurn = (threadId: ThreadId) =>
+      providerSessions.filter(
+        (session) => session.threadId === threadId && sessionHasInFlightTurn(session),
+      );
     const commandThread = commandReadModel.threads.find(
       (entry) => entry.id === event.payload.threadId,
     );
     const sessionCommandThread = commandReadModel.threads.find(
       (entry) => entry.id === sessionThreadId,
-    );
-    const providerSession = providerSessions.find(
-      (session) => session.threadId === sessionThreadId,
     );
     const currentThread = commandThread ?? thread;
     const hasPendingNonTerminalTurnStart = pendingTurnStarts.some(
@@ -1322,7 +1338,7 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       threadHasInFlightTurn(currentThread) ||
       (sessionCommandThread !== undefined && threadHasInFlightTurn(sessionCommandThread)) ||
       hasPendingNonTerminalTurnStart ||
-      providerSessionHasInFlightTurn(providerSession)
+      sessionsWithInFlightTurn(sessionThreadId).length > 0
     ) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
@@ -1381,24 +1397,42 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
     for (const peer of commandReadModel.threads) {
       if (relevantThreadIds.includes(peer.id)) continue;
       const providerThread = yield* resolveProviderSessionThread(projectionSnapshotQuery, peer.id);
-      const peerSession = providerSessions.find(
-        (session) => session.threadId === (providerThread?.id ?? peer.id),
-      );
+      const peerThreadId = providerThread?.id ?? peer.id;
+      const busyPeerSessions = sessionsWithInFlightTurn(peerThreadId);
       const pendingStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
         threadId: peer.id,
       });
-      if (
-        !threadHasInFlightTurn(peer) &&
-        !providerSessionHasInFlightTurn(peerSession) &&
-        !(Option.isSome(pendingStart) && peer.session?.status !== "error")
-      )
-        continue;
-      const peerCwd =
-        peerSession?.cwd ??
-        resolveThreadWorkspaceCwd({ thread: peer, projects: commandReadModel.projects });
-      if (!peerCwd) continue;
-      const peerIdentity = yield* turnCheckpointCoordinator.resolveWorkspaceIdentity(peerCwd);
-      if (peerIdentity !== checkpointWorkspaceIdentity) continue;
+      const reportedTurn =
+        threadHasInFlightTurn(peer) ||
+        (Option.isSome(pendingStart) && peer.session?.status !== "error");
+      if (!reportedTurn && busyPeerSessions.length === 0) continue;
+      // A session works where it started. A busy session names its own cwd,
+      // and a turn the projection or a pending start reports names the first
+      // listed session's as well, then the thread workspace. With no live
+      // session that turn starts in the thread workspace, so a retained
+      // context listed elsewhere does not stand in for it.
+      const peerWorkspaceCwd = resolveThreadWorkspaceCwd({
+        thread: peer,
+        projects: commandReadModel.projects,
+      });
+      const reportedSession = reportedTurn
+        ? providerSessions.find((session) => session.threadId === peerThreadId)
+        : undefined;
+      const cwdSessions =
+        reportedSession === undefined || busyPeerSessions.includes(reportedSession)
+          ? busyPeerSessions
+          : [...busyPeerSessions, reportedSession];
+      const reportedTurnStartsInWorkspace =
+        reportedTurn && !live.some((session) => session.threadId === peerThreadId);
+      const peerCwds = [
+        ...cwdSessions.map((session) => session.cwd ?? peerWorkspaceCwd),
+        ...(cwdSessions.length === 0 || reportedTurnStartsInWorkspace ? [peerWorkspaceCwd] : []),
+      ];
+      const peerIdentities = yield* Effect.forEach(
+        peerCwds.filter((peerCwd): peerCwd is string => peerCwd !== undefined),
+        (peerCwd) => turnCheckpointCoordinator.resolveWorkspaceIdentity(peerCwd),
+      );
+      if (!peerIdentities.includes(checkpointWorkspaceIdentity)) continue;
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
