@@ -3593,6 +3593,26 @@ const make = Effect.gen(function* () {
         });
       }
 
+      // A native subagent's resolved model (agent definition, env or tool input)
+      // only shows up in its own messages. Child threads only: the parent's
+      // model is the user's selection.
+      if (event.type === "thread.metadata.updated" && thread.id !== parentThread.id) {
+        const resolvedModel = event.payload.metadata?.model;
+        if (
+          thread.creationSource === "provider_native" &&
+          typeof resolvedModel === "string" &&
+          resolvedModel.length > 0 &&
+          resolvedModel !== thread.modelSelection.model
+        ) {
+          yield* orchestrationEngine.dispatch({
+            type: "thread.meta.update",
+            commandId: providerCommandId(event, "subagent-thread-model-update", thread.id),
+            threadId: thread.id,
+            modelSelection: { ...thread.modelSelection, model: resolvedModel },
+          });
+        }
+      }
+
       // A newer snapshot of this turn's cumulative diff later in the same journal
       // page supersedes this one (see coalesceProviderRuntimeProgress): skip the
       // patch parse and placeholder write, the survivor carries the newest files.
