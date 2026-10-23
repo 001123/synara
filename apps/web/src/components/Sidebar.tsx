@@ -270,6 +270,7 @@ import {
 } from "./sidebarHoverCardAnchors";
 import { PreviewCard, PreviewCardPopup, PreviewCardTrigger } from "./ui/preview-card";
 import {
+  type ActivityGroupMode,
   type ActivityScopeSelection,
   buildActivityViewModel,
   findNextThreadNeedingAttention,
@@ -1674,6 +1675,9 @@ export default function Sidebar() {
   const [activityScope, setActivityScope] = useState<ActivityScopeSelection>(
     () => readSidebarUiState().activityScope,
   );
+  const [activityGroupMode, setActivityGroupMode] = useState<ActivityGroupMode>(
+    () => readSidebarUiState().activityGroupMode,
+  );
   const [activityVisibleThreadIds, setActivityVisibleThreadIds] = useState<readonly ThreadId[]>([]);
   const [classicSnoozedVisibleThreadIds, setClassicSnoozedVisibleThreadIds] = useState<
     readonly ThreadId[]
@@ -1704,6 +1708,7 @@ export default function Sidebar() {
         setLastThreadRoute(state.lastThreadRoute);
         setActivityViewEnabled(state.activityViewEnabled);
         setActivityScope(state.activityScope);
+        setActivityGroupMode(state.activityGroupMode);
       }),
     [],
   );
@@ -3905,10 +3910,12 @@ export default function Sidebar() {
         lastThreadRoute: nextLastThreadRoute,
         activityViewEnabled,
         activityScope,
+        activityGroupMode,
       });
     },
     [
       activityScope,
+      activityGroupMode,
       activityViewEnabled,
       chatSectionExpanded,
       chatThreadListExtraPages,
@@ -4932,9 +4939,11 @@ export default function Sidebar() {
       lastThreadRoute,
       activityViewEnabled,
       activityScope,
+      activityGroupMode,
     });
   }, [
     activityScope,
+    activityGroupMode,
     activityViewEnabled,
     chatSectionExpanded,
     chatThreadListExtraPages,
@@ -7322,6 +7331,8 @@ export default function Sidebar() {
                         threadsHydrated={threadsHydrated}
                         scopeSelection={activityScope}
                         onScopeSelectionChange={setActivityScope}
+                        groupMode={activityGroupMode}
+                        onChangeGroupMode={setActivityGroupMode}
                         resolveThreadStatus={resolveThreadStatusForSidebar}
                         onOpenThread={activateThreadFromSidebarIntent}
                         onOpenThreadPullRequest={openThreadPullRequest}
