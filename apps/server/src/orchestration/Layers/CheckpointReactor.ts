@@ -534,6 +534,7 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
   // The command-model fallback carries no checkpoints, as before.
   const getThreadWithCheckpoints = Effect.fnUntraced(function* (
     threadId: ThreadId,
+    includeLiveCheckpoints = false,
   ): Effect.fn.Return<
     | {
         readonly thread: CheckpointThread;
@@ -547,7 +548,7 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       .pipe(Effect.orDie);
     if (Option.isSome(projected)) {
       const context = yield* projectionSnapshotQuery
-        .getThreadCheckpointContext(threadId)
+        .getThreadCheckpointContext(threadId, { includeLiveCheckpoints })
         .pipe(Effect.orDie);
       if (Option.isSome(context)) {
         return { thread: projected.value, checkpoints: context.value.checkpoints, projected: true };
@@ -757,6 +758,23 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       assistantMessageId: input.assistantMessageId,
     });
 
+    const liveTurn = yield* projectionTurnRepository
+      .getByTurnId({
+        threadId: input.threadId,
+        turnId: input.turnId,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("live turn diff cleanup lookup failed", { detail: error.message }).pipe(
+            Effect.as(Option.none()),
+          ),
+        ),
+      );
+    const liveRevision =
+      Option.isSome(liveTurn) && liveTurn.value.checkpointRef?.startsWith("provider-diff:")
+        ? liveTurn.value.checkpointRef.slice("provider-diff:".length)
+        : undefined;
+
     yield* orchestrationEngine.dispatch({
       type: "thread.turn.diff.complete",
       commandId: input.commandId ?? serverCommandId("checkpoint-turn-diff-complete"),
@@ -770,6 +788,19 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       checkpointTurnCount: input.turnCount,
       createdAt: input.createdAt,
     });
+
+    yield* checkpointStore
+      .deleteCheckpointRefs({
+        cwd: input.cwd,
+        checkpointRefs: [
+          checkpointRefForThreadTurnLive(input.threadId, input.turnId, liveRevision),
+        ],
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("live turn diff cleanup failed", { detail: error.message }),
+        ),
+      );
     yield* receiptBus.publish({
       type: "checkpoint.diff.finalized",
       threadId: input.threadId,
@@ -1010,16 +1041,13 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
   // let a later "missing" placeholder overwrite.
   const captureLiveTurnDiff = Effect.fnUntraced(function* (
     event: Extract<ProviderRuntimeEvent, { type: "item.completed" }>,
-    // A deferred (throttled) capture runs after its event: skip it once the
-    // provider session has stopped instead of reviving a settled turn.
-    deferred = false,
   ) {
     const turnId = toTurnId(event.turnId);
     if (!turnId) {
       return;
     }
 
-    const loaded = yield* getThreadWithCheckpoints(event.threadId);
+    const loaded = yield* getThreadWithCheckpoints(event.threadId, true);
     if (!loaded) {
       return;
     }
@@ -1033,13 +1061,55 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
     if (thread.session?.activeTurnId && !sameId(thread.session.activeTurnId, turnId)) {
       return;
     }
+    // Immediate and throttled completions can arrive after Stop. Preserve the
+    // last snapshot instead of attributing later checkout work to that turn.
     if (
-      deferred &&
-      (thread.session?.status === "stopped" ||
-        thread.session?.status === "interrupted" ||
-        thread.session?.status === "error")
+      thread.session?.status === "stopped" ||
+      thread.session?.status === "interrupted" ||
+      thread.session?.status === "error"
     ) {
       return;
+    }
+
+    // A ready/null session can mean either settled work or ingestion lagging a
+    // new turn. Fence by this exact turn, never by an ancestor's ready status.
+    const persistedTurn = yield* projectionTurnRepository.getByTurnId({
+      threadId: thread.id,
+      turnId,
+    });
+    if (
+      Option.isSome(persistedTurn) &&
+      (persistedTurn.value.completedAt !== null ||
+        persistedTurn.value.state === "completed" ||
+        persistedTurn.value.state === "interrupted" ||
+        persistedTurn.value.state === "error")
+    )
+      return;
+    // This independent consumer can observe terminal capture failure before
+    // ingestion projects it. Reuse the indexed journal owner at capture cadence.
+    const throttle = liveTurnDiffThrottles.get(thread.id);
+    const previousFence =
+      throttle?.terminalFence?.turnId === turnId ? throttle.terminalFence : undefined;
+    if (previousFence?.settled) return;
+    const throughSequence = yield* runtimeRepository.getHighWaterSequence;
+    if (previousFence === undefined || throughSequence > previousFence.throughSequence) {
+      const terminalEvents = yield* runtimeRepository
+        .readThreadEvents({
+          threadId: thread.id,
+          turnId,
+          throughSequenceInclusive: throughSequence,
+          afterSequenceExclusive: previousFence?.throughSequence ?? 0,
+          eventTypes: ["turn.completed", "turn.aborted"],
+          limit: 1,
+        })
+        .pipe(Effect.orDie);
+      // Advance only the successfully queried bound; concurrent journal appends
+      // belong to the next probe. A terminal observation remains sticky.
+      const settled =
+        terminalEvents.length > 0 ||
+        (throttle?.terminalFence?.turnId === turnId && throttle.terminalFence.settled === true);
+      if (throttle) throttle.terminalFence = { turnId, throughSequence, settled };
+      if (settled) return;
     }
 
     // Never override a real (non-placeholder) checkpoint already captured for
@@ -1079,54 +1149,89 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       fromCheckpointRef,
     });
 
-    const liveCheckpointRef = checkpointRefForThreadTurnLive(thread.id, turnId);
-    yield* checkpointStore.captureCheckpoint({
-      cwd: checkpointCwd,
-      checkpointRef: liveCheckpointRef,
-    });
-    const diff = yield* checkpointStore
-      .diffCheckpoints({
+    const liveCheckpointRef = checkpointRefForThreadTurnLive(thread.id, turnId, event.eventId);
+    const previousLiveRef = existingForTurn?.checkpointRef.startsWith("provider-diff:")
+      ? checkpointRefForThreadTurnLive(
+          thread.id,
+          turnId,
+          existingForTurn.checkpointRef.slice("provider-diff:".length),
+        )
+      : null;
+    let livePublished = false;
+    yield* Effect.gen(function* () {
+      yield* checkpointStore.captureCheckpoint({
+        cwd: checkpointCwd,
+        checkpointRef: liveCheckpointRef,
+        skipIfExists: true,
+      });
+      const diff = yield* checkpointStore.diffCheckpoints({
         cwd: checkpointCwd,
         fromCheckpointRef,
         toCheckpointRef: liveCheckpointRef,
         fallbackFromToHead: false,
         ignoreWhitespace: false,
-      })
-      .pipe(Effect.catch(() => Effect.succeed("")));
-    yield* checkpointStore
-      .deleteCheckpointRefs({ cwd: checkpointCwd, checkpointRefs: [liveCheckpointRef] })
-      .pipe(Effect.catch(() => Effect.void));
+      });
+      // Keep the latest immutable snapshot available to read-only turn diff queries;
+      // the terminal capture below retires it after publishing the canonical ref.
+      const files = yield* parseCheckpointFilesFromUnifiedDiff(diff);
+      if (files.length === 0 && !existingForTurn) {
+        return;
+      }
 
-    const files = yield* parseCheckpointFilesFromUnifiedDiff(diff);
-    if (files.length === 0) {
-      return;
-    }
+      // Align the placeholder turn count with the eventual terminal capture so
+      // both resolve to the same checkpoint entry (see captureCheckpointFromTurnCompletion).
+      const maxTurnCount = checkpoints.reduce(
+        (max, checkpoint) => Math.max(max, checkpoint.checkpointTurnCount),
+        0,
+      );
+      const checkpointTurnCount = existingForTurn
+        ? existingForTurn.checkpointTurnCount
+        : maxTurnCount + 1;
 
-    // Align the placeholder turn count with the eventual terminal capture so
-    // both resolve to the same checkpoint entry (see captureCheckpointFromTurnCompletion).
-    const maxTurnCount = checkpoints.reduce(
-      (max, checkpoint) => Math.max(max, checkpoint.checkpointTurnCount),
-      0,
+      yield* orchestrationEngine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: serverCommandId("checkpoint-live-turn-diff"),
+        threadId: thread.id,
+        turnId,
+        completedAt: event.createdAt,
+        // A provider-diff ref keeps the projector treating this as a live
+        // placeholder (turn stays "running") instead of an interrupted turn.
+        checkpointRef: CheckpointRef.makeUnsafe(`provider-diff:${event.eventId}`),
+        status: "missing",
+        files,
+        assistantMessageId: undefined,
+        checkpointTurnCount,
+        createdAt: event.createdAt,
+      });
+      livePublished = true;
+      if (previousLiveRef !== null && previousLiveRef !== liveCheckpointRef) {
+        yield* checkpointStore
+          .deleteCheckpointRefs({ cwd: checkpointCwd, checkpointRefs: [previousLiveRef] })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("superseded live turn diff cleanup failed", {
+                detail: error.message,
+              }),
+            ),
+          );
+      }
+    }).pipe(
+      Effect.ensuring(
+        Effect.suspend(() =>
+          livePublished || previousLiveRef === liveCheckpointRef
+            ? Effect.void
+            : checkpointStore
+                .deleteCheckpointRefs({ cwd: checkpointCwd, checkpointRefs: [liveCheckpointRef] })
+                .pipe(
+                  Effect.catch((error) =>
+                    Effect.logWarning("unpublished live turn diff cleanup failed", {
+                      detail: error.message,
+                    }),
+                  ),
+                ),
+        ),
+      ),
     );
-    const checkpointTurnCount = existingForTurn
-      ? existingForTurn.checkpointTurnCount
-      : maxTurnCount + 1;
-
-    yield* orchestrationEngine.dispatch({
-      type: "thread.turn.diff.complete",
-      commandId: serverCommandId("checkpoint-live-turn-diff"),
-      threadId: thread.id,
-      turnId,
-      completedAt: event.createdAt,
-      // A provider-diff ref keeps the projector treating this as a live
-      // placeholder (turn stays "running") instead of an interrupted turn.
-      checkpointRef: CheckpointRef.makeUnsafe(`provider-diff:${event.eventId}`),
-      status: "missing",
-      files,
-      assistantMessageId: undefined,
-      checkpointTurnCount,
-      createdAt: event.createdAt,
-    });
   });
 
   // Captures a real git checkpoint when a placeholder checkpoint (status "missing")
@@ -1955,6 +2060,11 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
   // processLane) and stays the authoritative checkpoint.
   type LiveTurnDiffThrottle = {
     lastCaptureAt: number;
+    terminalFence?: {
+      readonly turnId: TurnId;
+      readonly throughSequence: number;
+      readonly settled: boolean;
+    };
     pending:
       | {
           readonly event: Extract<ProviderRuntimeEvent, { type: "item.completed" }>;
@@ -1964,8 +2074,13 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
   };
   const liveTurnDiffThrottles = new Map<ThreadId, LiveTurnDiffThrottle>();
   const reactorScope = yield* Effect.scope;
-  const cancelLiveTurnDiff = (threadId: ThreadId) => {
-    liveTurnDiffThrottles.delete(threadId);
+  const cancelLiveTurnDiff = (threadId: ThreadId, turnId: TurnId | null, sequence: number) => {
+    const throttle = liveTurnDiffThrottles.get(threadId);
+    if (!throttle || !turnId) return;
+    const owningTurn = throttle.pending?.event.turnId ?? throttle.terminalFence?.turnId;
+    if (owningTurn !== turnId) return;
+    throttle.pending = undefined;
+    throttle.terminalFence = { turnId, throughSequence: sequence, settled: true };
   };
   const captureTrailingLiveTurnDiff = (threadId: ThreadId, throttle: LiveTurnDiffThrottle) =>
     Effect.suspend(() => {
@@ -1976,7 +2091,7 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       }
       throttle.pending = undefined;
       throttle.lastCaptureAt = Date.now();
-      const capture = withPinnedWorkspaceLease(captureLiveTurnDiff(pending.event, true));
+      const capture = withPinnedWorkspaceLease(captureLiveTurnDiff(pending.event));
       return (
         Option.isSome(pending.workspace)
           ? capture.pipe(Effect.provideService(PinnedCheckpointWorkspace, pending.workspace.value))
@@ -1996,22 +2111,29 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
     event: Extract<ProviderRuntimeEvent, { type: "item.completed" }>,
   ) {
     const now = Date.now();
-    const throttle = liveTurnDiffThrottles.get(event.threadId);
+    const cachedThrottle = liveTurnDiffThrottles.get(event.threadId);
+    const throttle =
+      cachedThrottle?.terminalFence && cachedThrottle.terminalFence.turnId !== event.turnId
+        ? undefined
+        : cachedThrottle;
     if (
       throttle === undefined ||
       (throttle.pending === undefined &&
         now - throttle.lastCaptureAt >= liveTurnDiffThrottleWindowMs)
     ) {
-      // Entries whose window closed with nothing pending carry no state.
-      for (const [threadId, entry] of liveTurnDiffThrottles) {
-        if (
-          entry.pending === undefined &&
-          now - entry.lastCaptureAt >= liveTurnDiffThrottleWindowMs
-        ) {
-          liveTurnDiffThrottles.delete(threadId);
+      // Preserve the exact-turn journal watermark across quiet windows. Retain
+      // at most one per thread; ordinary capacity eviction may recheck a prefix.
+      if (throttle === undefined && liveTurnDiffThrottles.size >= CHECKPOINT_REACTOR_CAPACITY) {
+        for (const [threadId, entry] of liveTurnDiffThrottles) {
+          if (entry.pending === undefined) {
+            liveTurnDiffThrottles.delete(threadId);
+            break;
+          }
         }
       }
-      liveTurnDiffThrottles.set(event.threadId, { lastCaptureAt: now, pending: undefined });
+      const current = throttle ?? { lastCaptureAt: now, pending: undefined };
+      current.lastCaptureAt = now;
+      liveTurnDiffThrottles.set(event.threadId, current);
       yield* captureLiveTurnDiff(event);
       return;
     }
@@ -2149,6 +2271,8 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
       for (const [threadId, workspace] of keys) {
         if (workspace.projectId === event.aggregateId) changedWorkspaceThreads.add(threadId);
       }
+    } else if (event.type === "thread.deleted") {
+      liveTurnDiffThrottles.delete(event.payload.threadId);
     } else if (event.type === "thread.session-set") {
       workspaceConfigurationSequence = event.sequence;
       if (keys.has(event.aggregateId)) changedSessionThreads.add(event.aggregateId);
@@ -2996,7 +3120,13 @@ const make = Effect.fnUntraced(function* (options?: CheckpointReactorLiveOptions
             if (!supersededLiveDiff) {
               const work =
                 nextRuntime.event.type === "turn.completed"
-                  ? Effect.sync(() => cancelLiveTurnDiff(nextRuntime.event.threadId)).pipe(
+                  ? Effect.sync(() =>
+                      cancelLiveTurnDiff(
+                        nextRuntime.event.threadId,
+                        toTurnId(nextRuntime.event.turnId),
+                        nextRuntime.sequence,
+                      ),
+                    ).pipe(
                       Effect.andThen(
                         processNativeCompletion(nextRuntime.sequence, nextRuntime.event),
                       ),
