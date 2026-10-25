@@ -161,6 +161,7 @@ import { Open, resolveAvailableEditors } from "./open";
 import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
+  ProviderDeliveryRecoveryError,
 } from "./orchestration/Errors";
 import { makeDispatchCommandNormalizer } from "./orchestration/dispatchCommandNormalization";
 import { sanitizeOrchestrationEventProviderOptions } from "./orchestration/providerOptionsSecurity";
@@ -379,6 +380,17 @@ function readDescendantProcesses(rootPid: number): Promise<ProcessTableRow[]> {
 export function toWsRpcError(cause: unknown, fallbackMessage: string) {
   if (Schema.is(WsRpcError)(cause)) {
     return cause;
+  }
+  if (cause instanceof ProviderDeliveryRecoveryError) {
+    return new WsRpcError({
+      message: cause.message,
+      code:
+        cause.reason === "stop-required"
+          ? "PROVIDER_DELIVERY_STOP_REQUIRED"
+          : "PROVIDER_DELIVERY_STOP_UNCONFIRMED",
+      retryable: false,
+      cause,
+    });
   }
   if (
     cause instanceof OrchestrationCommandInvariantError ||

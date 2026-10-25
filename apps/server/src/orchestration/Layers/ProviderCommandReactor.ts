@@ -191,6 +191,7 @@ import {
 import {
   OrchestrationCommandInternalError,
   OrchestrationCommandInvariantError,
+  ProviderDeliveryRecoveryError,
   type OrchestrationDispatchError,
 } from "../Errors.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -614,6 +615,21 @@ const isClaudeCompactionCancellationEvent = (
   OrchestrationEvent,
   { type: (typeof CLAUDE_COMPACTION_CANCELLATION_EVENTS)[number] }
 > => CLAUDE_COMPACTION_CANCELLATION_EVENTS.some((type) => type === event.type);
+
+type RecoverySendEvent = Extract<
+  ProviderIntentEvent,
+  {
+    type:
+      | "thread.turn-start-requested"
+      | "thread.message-edit-resend-requested"
+      | "thread.claude-cache-response-requested";
+  }
+>;
+const isRecoverySendEvent = (event: OrchestrationEvent): event is RecoverySendEvent =>
+  event.type === "thread.turn-start-requested" ||
+  event.type === "thread.message-edit-resend-requested" ||
+  (event.type === "thread.claude-cache-response-requested" &&
+    event.payload.decision === "continue");
 
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
@@ -5220,6 +5236,14 @@ const make = Effect.gen(function* () {
                     turnId: null,
                     createdAt: event.payload.createdAt,
                   });
+                // This request never entered the prompt queue. Its original
+                // turn already settled or was replaced; preserve that newer state.
+                if (
+                  failure instanceof ProviderAdapterValidationError &&
+                  failure.operation === "turn/steer.stale"
+                ) {
+                  return yield* Effect.failCause(cause);
+                }
                 // Restore the runtime's state after a refused reconfiguration or
                 // cancelled native control. An optimistic starting row must not
                 // make the ordered interrupt tear down an established runtime.
@@ -5376,6 +5400,54 @@ const make = Effect.gen(function* () {
     Stream.runCollect(
       orchestrationEngine.readEventsThrough(Math.max(0, eventSequence - 1), eventSequence),
     ).pipe(Effect.map((events) => Array.from(events)[0]));
+
+  // Replay and recovery must see the session other writers just persisted,
+  // even when its projection has not caught up yet.
+  const readLatestThreadSession = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    throughSequence?: number,
+  ) {
+    const highWater = throughSequence ?? (yield* orchestrationEngine.getEventHighWaterSequence);
+    return yield* orchestrationEngine
+      .readThreadEventsThrough(threadId, 0, highWater, ["thread.session-set"])
+      .pipe(
+        Stream.runFold(
+          () => null as OrchestrationSession | null,
+          (_latest, event) =>
+            event.type === "thread.session-set" ? event.payload.session : _latest,
+        ),
+      );
+  });
+
+  const readRecoverySendProvider = Effect.fnUntraced(function* (
+    event: RecoverySendEvent,
+    thread: Pick<OrchestrationThreadShell, "session" | "modelSelection"> | undefined,
+  ) {
+    const priorSession = yield* readLatestThreadSession(event.payload.threadId, event.sequence);
+    return event.type === "thread.claude-cache-response-requested"
+      ? "claudeAgent"
+      : (event.payload.modelSelection?.provider ??
+          priorSession?.providerName ??
+          thread?.session?.providerName ??
+          thread?.modelSelection.provider);
+  });
+
+  const hasUncertainClaudeSendBlocker = Effect.fnUntraced(function* (
+    thread: Pick<OrchestrationThreadShell, "id" | "session" | "modelSelection">,
+  ) {
+    const blocker = yield* deliveryRepository.firstBlockingDeliveryForThread({
+      consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+      threadId: thread.id,
+    });
+    if (Option.isNone(blocker) || blocker.value.state !== "uncertain") return false;
+    const source = yield* readOrchestrationEventAtSequence(blocker.value.eventSequence);
+    return (
+      source !== undefined &&
+      isRecoverySendEvent(source) &&
+      source.payload.threadId === thread.id &&
+      (yield* readRecoverySendProvider(source, thread)) === "claudeAgent"
+    );
+  });
 
   const readClaudeCompactionTerminal = Effect.fnUntraced(function* (
     threadId: ThreadId,
@@ -6422,6 +6494,7 @@ const make = Effect.gen(function* () {
     readonly turnId?: TurnId | undefined;
     readonly createdAt: string;
     readonly intentionalQuit?: boolean;
+    readonly requestedBy?: "user" | "agent" | "system";
   }) {
     // Kept on the detail read: the owner-FIFO tests model a thread whose shell
     // is missing while its detail is readable, and interrupts are rare.
@@ -6490,6 +6563,11 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           createdAt: input.createdAt,
           controlRequestId: input.controlRequestId,
+          ...(providerThread?.id === thread.id &&
+          replayReceipt.turnId === null &&
+          (yield* hasUncertainClaudeSendBlocker(thread))
+            ? { onlyIfNoActiveTurn: true as const }
+            : {}),
           ...(input.preserveQueuedWork ? { preserveQueuedWork: true } : {}),
           expectedLifecycleGeneration: replayReceipt.observedLifecycleGeneration,
         });
@@ -6502,6 +6580,44 @@ const make = Effect.gen(function* () {
         return;
     }
     const liveSession = observedRuntime.session ?? undefined;
+    const unfinishedStop = observedRuntime.stopControlReceipt;
+    const isIdleRecoveryRetry =
+      input.requestedBy === "user" &&
+      providerThread?.id === thread.id &&
+      unfinishedStop?.turnId === null &&
+      (yield* hasUncertainClaudeSendBlocker(thread));
+    if (
+      input.requestedBy === "user" &&
+      providerThread?.id === thread.id &&
+      unfinishedStop !== undefined &&
+      unfinishedStop.providerThreadId === undefined &&
+      (input.turnId === undefined ||
+        input.turnId === unfinishedStop.turnId ||
+        isIdleRecoveryRetry) &&
+      unfinishedStop.retiredLifecycleGeneration === undefined &&
+      observedRuntime.inheritedLifecycleGeneration !== observedRuntime.lifecycleGeneration
+    ) {
+      // Explicit Retry Stop continues the original receipt even when terminal
+      // projection arrived before physical cleanup. Never adopt a later target.
+      const currentTurnId = liveSession?.activeTurnId;
+      if (
+        unfinishedStop.observedLifecycleGeneration !== observedRuntime.lifecycleGeneration ||
+        (currentTurnId !== undefined && currentTurnId !== unfinishedStop.turnId) ||
+        (currentTurnId === undefined &&
+          thread.session?.activeTurnId != null &&
+          thread.session.activeTurnId !== unfinishedStop.turnId)
+      )
+        return;
+      return yield* processThreadSessionStop({
+        threadId: input.threadId,
+        createdAt: input.createdAt,
+        controlRequestId: unfinishedStop.controlRequestId,
+        ...(isIdleRecoveryRetry ? { onlyIfNoActiveTurn: true as const } : {}),
+        expectedLifecycleGeneration: unfinishedStop.observedLifecycleGeneration,
+        ...(thread.session ? { expectedSession: thread.session } : {}),
+        ...(input.preserveQueuedWork ? { preserveQueuedWork: true } : {}),
+      });
+    }
     const projectionHasWork = [thread, providerThread].some(
       (entry) =>
         entry?.session?.status === "starting" ||
@@ -6518,7 +6634,30 @@ const make = Effect.gen(function* () {
         providerThread?.session?.status !== "stopped");
     // The decider already paused the goal, and computer intent was cleared
     // above. Repeating Stop after settlement needs no adapter call or error row.
-    if (!projectionHasWork && !hasUnsettledTarget && !hasLiveProviderWork(liveSession)) return;
+    if (!projectionHasWork && !hasLiveProviderWork(liveSession)) {
+      if (
+        input.requestedBy === "user" &&
+        providerThread?.id === thread.id &&
+        observedRuntime.lifecycleGeneration !== null &&
+        observedRuntime.inheritedLifecycleGeneration !== observedRuntime.lifecycleGeneration &&
+        (unfinishedStop === undefined || unfinishedStop.retiredLifecycleGeneration !== undefined)
+      ) {
+        // A failed local ownership attempt can rewind to an empty generation,
+        // or leave an owned idle query. Only explicit Stop for a durable root
+        // Claude send may retire it; ordinary ready and inherited Stops stay inert.
+        if (yield* hasUncertainClaudeSendBlocker(thread)) {
+          return yield* processThreadSessionStop({
+            threadId: thread.id,
+            createdAt: input.createdAt,
+            controlRequestId: input.controlRequestId,
+            expectedLifecycleGeneration: observedRuntime.lifecycleGeneration,
+            ...(observedRuntime.session !== null ? { onlyIfNoActiveTurn: true as const } : {}),
+            ...(thread.session ? { expectedSession: thread.session } : {}),
+          });
+        }
+      }
+      if (!hasUnsettledTarget) return;
+    }
 
     // The projection can lag a live turn. Only use session stop when neither
     // side owns a turn to interrupt, and retire the runtime rather than just
@@ -6754,6 +6893,9 @@ const make = Effect.gen(function* () {
       threadId: event.payload.threadId,
       turnId: event.payload.turnId,
       createdAt: event.payload.createdAt,
+      ...(event.payload.requestedBy !== undefined
+        ? { requestedBy: event.payload.requestedBy }
+        : {}),
       intentionalQuit: event.commandId?.startsWith("quit-resume-interrupt:") === true,
     });
   });
@@ -7298,6 +7440,7 @@ const make = Effect.gen(function* () {
     readonly expectedSession?: OrchestrationSession;
     readonly expectedLifecycleGeneration?: string | null;
     readonly controlRequestId?: string;
+    readonly onlyIfNoActiveTurn?: true;
     readonly preserveQueuedWork?: boolean;
   }) {
     const thread = yield* resolveThreadShell(input.threadId);
@@ -7380,6 +7523,7 @@ const make = Effect.gen(function* () {
             call: providerService
               .stopRuntimeSession({
                 threadId: providerThread.id,
+                ...(input.onlyIfNoActiveTurn === true ? { onlyIfNoActiveTurn: true as const } : {}),
                 ...(input.controlRequestId !== undefined
                   ? { controlRequestId: input.controlRequestId }
                   : {}),
@@ -7819,9 +7963,15 @@ const make = Effect.gen(function* () {
           expectedGoalStartedAt: thread.goalStartedAt ?? null,
         });
       }
+      const owner = thread ? yield* resolveProviderSessionThread(thread.id) : null;
       yield* processThreadSessionStop({
         threadId: event.payload.threadId,
         createdAt: event.payload.createdAt,
+        // The existing primitive pins this Stop's generation under its lifecycle
+        // lock. A replay must keep that receipt instead of adopting a new runtime.
+        ...(thread && owner?.id === thread.id
+          ? { controlRequestId: turnStartKeyForEvent(event) }
+          : {}),
       });
     });
 
@@ -8445,20 +8595,134 @@ const make = Effect.gen(function* () {
       return true;
     });
 
-    // Replay and recovery must see the session other writers just persisted,
-    // even when its projection has not caught up yet.
-    const readLatestThreadSession = Effect.fnUntraced(function* (threadId: ThreadId) {
-      const highWater = yield* orchestrationEngine.getEventHighWaterSequence;
-      return yield* orchestrationEngine
-        .readThreadEventsThrough(threadId, 0, highWater, ["thread.session-set"])
-        .pipe(
-          Stream.runFold(
-            () => null as OrchestrationSession | null,
-            (_latest, event) =>
-              event.type === "thread.session-set" ? event.payload.session : _latest,
-          ),
+    // Root Claude recovery waits for verified Stop. Untouched inherited
+    // delivery can be reconciled without claiming prior OS-process cleanup.
+    // The final check and SQL mutation share the provider lifecycle lease.
+    const withClaudeSendRecoverySafe = <A, E, R>(
+      event: ProviderIntentEvent,
+      reconciliation: Effect.Effect<A, E, R>,
+    ) => {
+      let committing = false;
+      const commit = Effect.suspend(() => {
+        committing = true;
+        return reconciliation;
+      });
+      return Effect.gen(function* () {
+        if (!isRecoverySendEvent(event)) return yield* commit;
+        const refuse = (reason: "stop-required" | "stop-unconfirmed") =>
+          Effect.fail(new ProviderDeliveryRecoveryError({ reason }));
+        const thread = yield* resolveThreadShell(event.payload.threadId);
+        const provider = yield* readRecoverySendProvider(event, thread);
+        if (provider !== "claudeAgent") return yield* commit;
+        const owner = yield* resolveProviderSessionThread(event.payload.threadId);
+        // Child delivery keeps its existing explicit-abandon semantics. A root
+        // Stop receipt cannot prove child delivery or authorize stopping its parent.
+        if (thread && owner && owner.id !== thread.id) return yield* commit;
+        const readTarget = providerService.getRuntimeSessionStopTarget;
+        const withTarget = providerService.withRuntimeSessionStopTarget;
+        const readRetained = providerService.listRetainedSessions;
+        const readWork = providerService.hasLiveRuntimeTasks;
+        if (!thread || !owner || !readTarget || !withTarget || !readRetained || !readWork) {
+          return yield* refuse("stop-unconfirmed");
+        }
+        const inspect = (target: ProviderRuntimeSessionStopTarget) =>
+          Effect.gen(function* () {
+            const [sessions, retained, hasWork] = yield* Effect.all([
+              providerService.listSessions(),
+              readRetained(),
+              readWork({ threadId: owner.id }),
+            ]);
+            return { target, sessions, retained, hasWork };
+          });
+        const locallyEmpty = (observation: {
+          target: ProviderRuntimeSessionStopTarget;
+          sessions: ReadonlyArray<ProviderSession>;
+          retained: ReadonlyArray<ProviderSession>;
+          hasWork: boolean;
+        }) =>
+          observation.target.session === null &&
+          !observation.hasWork &&
+          !observation.sessions.some((session) => session.threadId === owner.id) &&
+          !observation.retained.some((session) => session.threadId === owner.id);
+        const initial = yield* inspect(yield* readTarget({ threadId: owner.id }));
+        const target = initial.target;
+        if (target.session !== null) return yield* refuse("stop-required");
+        if (!locallyEmpty(initial)) return yield* refuse("stop-unconfirmed");
+        const inherited =
+          target.lifecycleGeneration !== null &&
+          target.inheritedLifecycleGeneration === target.lifecycleGeneration;
+        const receipt = target.stopControlReceipt;
+        if (!inherited) {
+          if (
+            !receipt ||
+            receipt.providerThreadId !== undefined ||
+            receipt.retiredLifecycleGeneration === undefined ||
+            receipt.retiredLifecycleGeneration !== target.lifecycleGeneration
+          ) {
+            return yield* refuse("stop-unconfirmed");
+          }
+          // Match journal order and identity; an older Stop cannot authorize
+          // a later ambiguous send, regardless of its wall-clock timestamps.
+          const highWater = yield* orchestrationEngine.getEventHighWaterSequence;
+          const matchingStop = yield* orchestrationEngine
+            .readThreadEventsThrough(owner.id, event.sequence, highWater, [
+              "thread.turn-interrupt-requested",
+              "thread.session-stop-requested",
+            ])
+            .pipe(
+              Stream.filter(
+                (candidate) =>
+                  (candidate.type === "thread.turn-interrupt-requested" ||
+                    candidate.type === "thread.session-stop-requested") &&
+                  turnStartKeyForEvent(candidate) === receipt.controlRequestId,
+              ),
+              Stream.runHead,
+            );
+          if (Option.isNone(matchingStop)) return yield* refuse("stop-unconfirmed");
+        }
+        return yield* withTarget({ threadId: owner.id }, (confirmed) =>
+          Effect.gen(function* () {
+            // Do not reacquire the lifecycle lock here. Only local reads and the
+            // delivery SQL mutation belong in this lease; replay runs afterwards.
+            const final = yield* inspect(confirmed);
+            if (
+              !locallyEmpty(final) ||
+              confirmed.lifecycleGeneration !== target.lifecycleGeneration ||
+              (inherited
+                ? confirmed.inheritedLifecycleGeneration !== target.lifecycleGeneration
+                : confirmed.stopControlReceipt?.controlRequestId !== receipt?.controlRequestId ||
+                  confirmed.stopControlReceipt?.retiredLifecycleGeneration !==
+                    target.lifecycleGeneration)
+            ) {
+              return yield* refuse("stop-unconfirmed");
+            }
+            return yield* commit;
+          }),
         );
-    });
+      }).pipe(
+        Effect.timeoutOption(PROVIDER_COMMAND_INTERRUPT_TIMEOUT),
+        Effect.flatMap((result) =>
+          Option.isSome(result)
+            ? Effect.succeed(result.value)
+            : committing
+              ? Effect.fail(
+                  new Error(
+                    "Delivery reconciliation did not finish. Refresh the blocker before trying again.",
+                  ),
+                )
+              : Effect.fail(new ProviderDeliveryRecoveryError({ reason: "stop-unconfirmed" })),
+        ),
+        Effect.catchCause((cause) => {
+          if (committing || Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause);
+          const error = Option.getOrUndefined(Cause.findErrorOption(cause));
+          return Effect.fail(
+            error instanceof ProviderDeliveryRecoveryError
+              ? error
+              : new ProviderDeliveryRecoveryError({ reason: "stop-unconfirmed" }),
+          );
+        }),
+      );
+    };
 
     // The "Unblock thread" action only renders for the block-detail contract.
     // Merge its current reason over the durable session without flattening a
@@ -9237,7 +9501,7 @@ const make = Effect.gen(function* () {
                   review.reviewId,
                 );
               }
-              const reconciled = yield* deliveryRepository.reconcile({
+              const reconciliation = deliveryRepository.reconcile({
                 reconciliationId: crypto.randomUUID(),
                 consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
                 eventSequence: input.eventSequence,
@@ -9248,6 +9512,13 @@ const make = Effect.gen(function* () {
                 ...(input.note === undefined ? {} : { note: input.note }),
                 reconciledAt,
               });
+              const guardedSend =
+                input.outcome === "abandon" &&
+                delivery.value.state === "uncertain" &&
+                isRecoverySendEvent(reconciledEvent);
+              const reconciled = yield* guardedSend
+                ? withClaudeSendRecoverySafe(reconciledEvent, reconciliation)
+                : reconciliation;
               if (Option.isNone(reconciled)) return null;
 
               if (reconciledEvent.type === "thread.claude-cache-response-requested") {
