@@ -82,6 +82,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
   type ProviderRuntimeStopControlReceipt,
+  type ProviderRuntimeSessionStopTarget,
 } from "../Services/ProviderService.ts";
 import {
   ProviderSessionDirectory,
@@ -1077,6 +1078,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           discard: true,
         }),
       );
+    // Adopt once at startup. An inherited binding carries no query/control
+    // promise in this server; any local ownership attempt revokes that lineage,
+    // including attempts whose lifecycle generation later rewinds on failure.
+    const inheritedRuntimeGenerations = new Map<ThreadId, string>();
     const lifecycleCoordinator = makeProviderLifecycleCoordinator();
     const lifecycle: typeof lifecycleCoordinator = {
       ...lifecycleCoordinator,
@@ -1086,13 +1091,17 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         lifecycleCoordinator.run(
           threadId,
           operation,
-          (prepare ?? Effect.void).pipe(Effect.andThen(flushRuntimeText(threadId))),
+          Effect.sync(() => inheritedRuntimeGenerations.delete(threadId)).pipe(
+            Effect.andThen(prepare ?? Effect.void),
+            Effect.andThen(flushRuntimeText(threadId)),
+          ),
           onLockTimeout,
         ),
     };
     for (const binding of yield* directory.listBindings()) {
       if (binding.lifecycleGeneration !== undefined) {
         lifecycle.adoptCurrent(binding.threadId, binding.lifecycleGeneration);
+        inheritedRuntimeGenerations.set(binding.threadId, binding.lifecycleGeneration);
       }
     }
     const runtimeEventBufferCapacity = Math.max(
@@ -1399,6 +1408,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       options?: { readonly scheduleIdleStopOnSuccess?: boolean },
     ): Effect.Effect<A, E | ProviderValidationError, R> =>
       Effect.suspend(() => {
+        inheritedRuntimeGenerations.delete(threadId);
         const waitForInterruptionFence = waitForCurrentInterruptionFence(threadId).pipe(
           Effect.flatMap((interruptionFence) =>
             interruptionFence?.failure
@@ -2405,6 +2415,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 }),
               );
             }
+            inheritedRuntimeGenerations.delete(threadId);
             if (
               adapter.renewAgentGatewayCredential &&
               (yield* adapter.renewAgentGatewayCredential(threadId))
@@ -2594,6 +2605,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             };
             // Prompt construction has already happened here. Only explicit startup
             // may replace lost native history and request a transcript recap.
+            inheritedRuntimeGenerations.delete(threadId);
             const resumed = yield* adapter.startSession(resumeStartInput);
             if (resumed.provider !== adapter.provider) {
               return yield* toValidationError(
@@ -2794,6 +2806,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             if (!staleSession) {
               return;
             }
+            inheritedRuntimeGenerations.delete(input.threadId);
             yield* adapter.stopSession(input.threadId).pipe(
               Effect.catchCause((cause) =>
                 Effect.logWarning("provider.session.stop-stale-failed", {
@@ -4467,6 +4480,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                     : runtimeActiveTurnId(binding.runtimePayload),
                 operation: "ProviderService.interruptTurn",
               });
+              inheritedRuntimeGenerations.delete(input.threadId);
               const boundActiveTurnId = runtimeActiveTurnId(binding.runtimePayload);
               const providerTurnId =
                 input.providerThreadId !== undefined ? input.turnId : boundActiveTurnId;
@@ -4645,6 +4659,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   `Provider '${routed.adapter.provider}' does not support stopping a provider task.`,
                 );
               }
+              inheritedRuntimeGenerations.delete(input.threadId);
               yield* routed.adapter.stopTask(input.threadId, input.taskId);
             }),
           ),
@@ -4677,6 +4692,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                   `Provider '${routed.adapter.provider}' does not support backgrounding a provider task.`,
                 );
               }
+              inheritedRuntimeGenerations.delete(input.threadId);
               yield* routed.adapter.backgroundTask(input.threadId, input.toolUseId);
             }),
           ),
@@ -4710,6 +4726,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 );
               }
               const attachments = carryProviderAttachmentPaths(rawInput, input.attachments ?? []);
+              inheritedRuntimeGenerations.delete(input.threadId);
               yield* routed.adapter.steerSubagent(input.threadId, input.providerThreadId, {
                 input: input.input ?? "",
                 ...(attachments.length > 0 ? { attachments } : {}),
@@ -4774,6 +4791,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
               reason: "stale-interaction",
             });
           }
+          inheritedRuntimeGenerations.delete(input.threadId);
           if (response.kind === "approval") {
             yield* routed.adapter.respondToRequest(
               input.threadId,
@@ -4860,29 +4878,52 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         );
       });
 
+    const readRuntimeSessionStopTarget = (
+      input: { readonly threadId: ThreadId },
+      generation: string | undefined,
+    ) =>
+      Effect.gen(function* () {
+        const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        const adapter = binding ? yield* getAdapterForBinding(binding) : null;
+        const activeSession =
+          adapter && (yield* adapter.hasSession(input.threadId))
+            ? (yield* adapter.listSessions()).find((session) => session.threadId === input.threadId)
+            : undefined;
+        const target: ProviderRuntimeSessionStopTarget = {
+          session: activeSession
+            ? yield* sessionWithPersistedProviderInstance(activeSession)
+            : null,
+          lifecycleGeneration: generation ?? null,
+          ...(generation !== undefined &&
+          inheritedRuntimeGenerations.get(input.threadId) === generation
+            ? { inheritedLifecycleGeneration: generation }
+            : {}),
+          ...(binding && runtimeStopControlReceipt(binding.runtimePayload)
+            ? { stopControlReceipt: runtimeStopControlReceipt(binding.runtimePayload)! }
+            : {}),
+        };
+        return target;
+      });
+
     const getRuntimeSessionStopTarget: NonNullable<
       ProviderServiceShape["getRuntimeSessionStopTarget"]
     > = (input) =>
       lifecycle.runCurrent(input.threadId, (generation) =>
-        Effect.gen(function* () {
-          const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
-          const adapter = binding ? yield* getAdapterForBinding(binding) : null;
-          const activeSession =
-            adapter && (yield* adapter.hasSession(input.threadId))
-              ? (yield* adapter.listSessions()).find(
-                  (session) => session.threadId === input.threadId,
-                )
-              : undefined;
-          return {
-            session: activeSession
-              ? yield* sessionWithPersistedProviderInstance(activeSession)
-              : null,
-            lifecycleGeneration: generation ?? null,
-            ...(binding && runtimeStopControlReceipt(binding.runtimePayload)
-              ? { stopControlReceipt: runtimeStopControlReceipt(binding.runtimePayload)! }
-              : {}),
-          };
-        }),
+        readRuntimeSessionStopTarget(input, generation),
+      );
+
+    const withRuntimeSessionStopTarget: NonNullable<
+      ProviderServiceShape["withRuntimeSessionStopTarget"]
+    > = (input, use) =>
+      lifecycle.runCurrentUrgent(
+        input.threadId,
+        (generation) => readRuntimeSessionStopTarget(input, generation).pipe(Effect.flatMap(use)),
+        Effect.fail(
+          toValidationError(
+            "ProviderService.withRuntimeSessionStopTarget",
+            "Runtime ownership is busy; delivery reconciliation was not attempted.",
+          ),
+        ),
       );
 
     const stopRuntimeSessionInternal = (
@@ -5424,9 +5465,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           operation: "ProviderService.getClaudeCacheObservation",
           allowRecovery: false,
         });
-        return routed.adapter.getClaudeCacheObservation
-          ? yield* routed.adapter.getClaudeCacheObservation(threadId)
-          : undefined;
+        if (!routed.adapter.getClaudeCacheObservation) return undefined;
+        if (routed.isActive) inheritedRuntimeGenerations.delete(threadId);
+        return yield* routed.adapter.getClaudeCacheObservation(threadId);
       });
 
     const getCapabilities: ProviderServiceShape["getCapabilities"] = (provider) =>
@@ -5658,6 +5699,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       stopSession,
       stopRuntimeSession,
       getRuntimeSessionStopTarget,
+      withRuntimeSessionStopTarget,
       hasLiveRuntimeTasks,
       clearSessionResumeCursor,
       listSessions,
