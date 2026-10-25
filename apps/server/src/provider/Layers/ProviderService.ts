@@ -69,6 +69,7 @@ import { computerApprovalGate } from "../../computer/ComputerApprovalGate.ts";
 
 import {
   type ProviderAdapterError,
+  type ProviderServiceError,
   ProviderAdapterProcessError,
   ProviderUnsupportedError,
   ProviderValidationError,
@@ -4914,8 +4915,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
 
     const withRuntimeSessionStopTarget: NonNullable<
       ProviderServiceShape["withRuntimeSessionStopTarget"]
-    > = (input, use) =>
-      lifecycle.runCurrentUrgent(
+    > = <A, E, R>(
+      input: { readonly threadId: ThreadId },
+      use: (target: ProviderRuntimeSessionStopTarget) => Effect.Effect<A, E, R>,
+    ) =>
+      lifecycle.runCurrentUrgent<A, E | ProviderServiceError, R>(
         input.threadId,
         (generation) => readRuntimeSessionStopTarget(input, generation).pipe(Effect.flatMap(use)),
         Effect.fail(
