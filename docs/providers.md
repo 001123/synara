@@ -53,7 +53,9 @@ that delivery; it does not stop a provider process that is still running. For a 
 turn, use **Stop** first and wait for session retirement, then abandon the uncertain delivery
 with **Unblock thread** before explicitly sending a new message. An ambiguous Claude send
 on a root thread stays blocked while this server owns a live or unverified runtime. Stop's dispatch acknowledgement
-alone does not prove that cleanup finished. After a server restart, Unblock may reconcile an
+alone does not prove that cleanup finished. If a failed local startup leaves the session idle,
+an explicit user Stop can still retire that known local generation before Unblock. Ordinary
+idle Stops without an uncertain root Claude send remain no-ops. After a server restart, Unblock may reconcile an
 untouched inherited delivery once the new server confirms it owns no live, retained or background
 work for that task. This restores delivery; it does not prove that every process from an older
 server exited or that its external effects were cancelled. Synara does not automatically resend

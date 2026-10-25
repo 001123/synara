@@ -315,6 +315,7 @@ async function waitFor(
 function createRetainingRestartProviderServiceLayer(options?: {
   readonly failFirstTeardown?: boolean;
   readonly liveTurns?: boolean;
+  readonly failStart?: () => boolean;
 }) {
   const unsupported = () => Effect.die(new Error("Unsupported adapter call in test"));
   const adapterFor = <P extends ProviderKind>(
@@ -344,22 +345,34 @@ function createRetainingRestartProviderServiceLayer(options?: {
       provider,
       capabilities: { sessionModelSwitch: "in-session" },
       startSession: (input) =>
-        teardown(input.threadId, "session/restart").pipe(
-          Effect.map(() => {
-            const now = new Date().toISOString();
-            const session: ProviderSession = {
-              provider,
-              status: "ready",
-              runtimeMode: input.runtimeMode,
-              threadId: input.threadId,
-              ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
-              ...(input.cwd ? { cwd: input.cwd } : {}),
-              createdAt: now,
-              updatedAt: now,
-            };
-            sessions.set(input.threadId, session);
-            return session;
-          }),
+        Effect.suspend(() =>
+          options?.failStart?.()
+            ? Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider,
+                  method: "session/start",
+                  detail: "Synthetic startup rejected before query creation",
+                }),
+              )
+            : teardown(input.threadId, "session/restart").pipe(
+                Effect.map(() => {
+                  const now = new Date().toISOString();
+                  const session: ProviderSession = {
+                    provider,
+                    status: "ready",
+                    runtimeMode: input.runtimeMode,
+                    threadId: input.threadId,
+                    ...(input.providerInstanceId
+                      ? { providerInstanceId: input.providerInstanceId }
+                      : {}),
+                    ...(input.cwd ? { cwd: input.cwd } : {}),
+                    createdAt: now,
+                    updatedAt: now,
+                  };
+                  sessions.set(input.threadId, session);
+                  return session;
+                }),
+              ),
         ),
       sendTurn: (input) =>
         Effect.sync(() => {
@@ -18470,6 +18483,188 @@ describe("ProviderCommandReactor", () => {
           ? { status: "stopped", activeTurnId: null, lastError: session.lastError }
           : session,
       );
+    },
+  );
+
+  it.each([
+    "failed start",
+    "interrupted projection",
+    "replacement epoch",
+    "no blocker",
+    "agent Stop",
+  ] as const)(
+    "explicit recovery Stop handles a real failed-start rewind with %s",
+    async (scenario) => {
+      let failStart = false;
+      const harness = await createHarness({
+        threadModelSelection: { provider: "claudeAgent", model: "claude-fable-5-1" },
+        providerServiceLayer: createRetainingRestartProviderServiceLayer({
+          failFirstTeardown: false,
+          liveTurns: true,
+          failStart: () => failStart,
+        }),
+        startReactor: false,
+      });
+      const threadId = ThreadId.makeUnsafe("thread-1");
+      const now = new Date().toISOString();
+      const provider = harness.realProviderService;
+      const readTarget = provider.getRuntimeSessionStopTarget!;
+      await Effect.runPromise(
+        provider.startSession(threadId, {
+          threadId,
+          provider: "claudeAgent",
+          runtimeMode: "approval-required",
+        }),
+      );
+      await Effect.runPromise(provider.stopRuntimeSession!({ threadId }));
+      const beforeFailure = await Effect.runPromise(readTarget({ threadId }));
+      failStart = true;
+      const failed = await Effect.runPromise(
+        provider
+          .startSession(threadId, {
+            threadId,
+            provider: "claudeAgent",
+            runtimeMode: "approval-required",
+          })
+          .pipe(Effect.exit),
+      );
+      failStart = false;
+      expect(Exit.isFailure(failed)).toBe(true);
+      const rewound = await Effect.runPromise(readTarget({ threadId }));
+      expect(rewound).toMatchObject({
+        session: null,
+        lifecycleGeneration: beforeFailure.lifecycleGeneration,
+      });
+      expect(rewound.inheritedLifecycleGeneration).toBeUndefined();
+      expect(rewound.stopControlReceipt).toBeUndefined();
+      const source = await dispatchHarnessUserTurn(harness, {
+        messageId: "rewound-uncertain-send",
+        text: "Ambiguous synthetic send",
+        createdAt: now,
+      });
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.makeUnsafe("rewound-idle-session"),
+          threadId,
+          session: {
+            threadId,
+            providerName: "claudeAgent",
+            status: scenario === "interrupted projection" ? "interrupted" : "stopped",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+      if (scenario !== "no blocker") {
+        await Effect.runPromise(
+          harness.deliveryRepository.claim({
+            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+            eventSequence: source.sequence,
+            threadId,
+            claimOwner: "previous-owner",
+            claimedAt: now,
+            claimExpiresAt: now,
+          }),
+        );
+        await Effect.runPromise(
+          harness.deliveryRepository.markTerminalFailure({
+            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+            eventSequence: source.sequence,
+            expectedClaimOwner: "previous-owner",
+            state: "uncertain",
+            error: "Synthetic ambiguity",
+            updatedAt: now,
+          }),
+        );
+      }
+      for (const event of Array.from(
+        await Effect.runPromise(Stream.runCollect(harness.engine.readEvents(0))),
+      )) {
+        await Effect.runPromise(
+          harness.deliveryRepository.advanceCursor({
+            consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+            eventSequence: event.sequence,
+            updatedAt: now,
+          }),
+        );
+      }
+      await harness.startReactor();
+      const recover = () =>
+        Effect.runPromise(
+          harness.reactor.reconcileDelivery({
+            threadId,
+            eventSequence: source.sequence,
+            expectedState: "uncertain",
+            outcome: "abandon",
+            reconciledBy: "test-rewound-explicit-stop",
+          }),
+        );
+      if (scenario !== "no blocker") {
+        expect(await recover().catch((error: unknown) => error)).toMatchObject({
+          reason: "stop-unconfirmed",
+        });
+      }
+      const sends = vi.spyOn(provider, "sendTurn");
+      const interrupts = vi.spyOn(provider, "interruptTurn");
+      const stops = vi.spyOn(provider, "stopRuntimeSession");
+      if (scenario === "replacement epoch") {
+        vi.spyOn(provider, "getRuntimeSessionStopTarget").mockImplementationOnce((input) =>
+          readTarget(input).pipe(
+            Effect.tap(() =>
+              Effect.gen(function* () {
+                yield* provider.startSession(threadId, {
+                  threadId,
+                  provider: "claudeAgent",
+                  runtimeMode: "approval-required",
+                });
+                yield* provider.sendTurn({ threadId, input: "Replacement" });
+              }),
+            ),
+          ),
+        );
+      }
+      const commandId = CommandId.makeUnsafe("rewound-new-explicit-stop");
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.interrupt",
+          commandId,
+          threadId,
+          ...(scenario === "interrupted projection"
+            ? { turnId: asTurnId("old-turn-never-projected") }
+            : {}),
+          requestedBy: scenario === "agent Stop" ? "agent" : "user",
+          createdAt: now,
+        }),
+      );
+      await harness.drain();
+      const after = await Effect.runPromise(readTarget({ threadId }));
+      if (scenario === "failed start" || scenario === "interrupted projection") {
+        expect(after.stopControlReceipt).toMatchObject({
+          controlRequestId: `command:${commandId}`,
+          observedLifecycleGeneration: rewound.lifecycleGeneration,
+          retiredLifecycleGeneration: after.lifecycleGeneration,
+        });
+        expect(after.lifecycleGeneration).not.toBe(rewound.lifecycleGeneration);
+        expect(await recover()).toMatchObject({ state: "succeeded", outcome: "abandon" });
+      } else {
+        expect(after.stopControlReceipt).toBeUndefined();
+        if (scenario === "replacement epoch") {
+          expect(after.lifecycleGeneration).not.toBe(rewound.lifecycleGeneration);
+          expect(after.session).toMatchObject({
+            status: "running",
+            activeTurnId: "claudeAgent-turn",
+          });
+        } else {
+          expect(after.lifecycleGeneration).toBe(rewound.lifecycleGeneration);
+          expect(stops).not.toHaveBeenCalled();
+        }
+      }
+      expect(interrupts).not.toHaveBeenCalled();
+      expect(sends).toHaveBeenCalledTimes(scenario === "replacement epoch" ? 1 : 0);
     },
   );
 

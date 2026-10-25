@@ -616,6 +616,21 @@ const isClaudeCompactionCancellationEvent = (
   { type: (typeof CLAUDE_COMPACTION_CANCELLATION_EVENTS)[number] }
 > => CLAUDE_COMPACTION_CANCELLATION_EVENTS.some((type) => type === event.type);
 
+type RecoverySendEvent = Extract<
+  ProviderIntentEvent,
+  {
+    type:
+      | "thread.turn-start-requested"
+      | "thread.message-edit-resend-requested"
+      | "thread.claude-cache-response-requested";
+  }
+>;
+const isRecoverySendEvent = (event: OrchestrationEvent): event is RecoverySendEvent =>
+  event.type === "thread.turn-start-requested" ||
+  event.type === "thread.message-edit-resend-requested" ||
+  (event.type === "thread.claude-cache-response-requested" &&
+    event.payload.decision === "continue");
+
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const PROVIDER_COMMAND_CLAIM_LEASE_MS = 30_000;
@@ -5386,6 +5401,37 @@ const make = Effect.gen(function* () {
       orchestrationEngine.readEventsThrough(Math.max(0, eventSequence - 1), eventSequence),
     ).pipe(Effect.map((events) => Array.from(events)[0]));
 
+  // Replay and recovery must see the session other writers just persisted,
+  // even when its projection has not caught up yet.
+  const readLatestThreadSession = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    throughSequence?: number,
+  ) {
+    const highWater = throughSequence ?? (yield* orchestrationEngine.getEventHighWaterSequence);
+    return yield* orchestrationEngine
+      .readThreadEventsThrough(threadId, 0, highWater, ["thread.session-set"])
+      .pipe(
+        Stream.runFold(
+          () => null as OrchestrationSession | null,
+          (_latest, event) =>
+            event.type === "thread.session-set" ? event.payload.session : _latest,
+        ),
+      );
+  });
+
+  const readRecoverySendProvider = Effect.fnUntraced(function* (
+    event: RecoverySendEvent,
+    thread: Pick<OrchestrationThreadShell, "session" | "modelSelection"> | undefined,
+  ) {
+    const priorSession = yield* readLatestThreadSession(event.payload.threadId, event.sequence);
+    return event.type === "thread.claude-cache-response-requested"
+      ? "claudeAgent"
+      : (event.payload.modelSelection?.provider ??
+          priorSession?.providerName ??
+          thread?.session?.providerName ??
+          thread?.modelSelection.provider);
+  });
+
   const readClaudeCompactionTerminal = Effect.fnUntraced(function* (
     threadId: ThreadId,
     turnId: TurnId,
@@ -6558,7 +6604,42 @@ const make = Effect.gen(function* () {
         providerThread?.session?.status !== "stopped");
     // The decider already paused the goal, and computer intent was cleared
     // above. Repeating Stop after settlement needs no adapter call or error row.
-    if (!projectionHasWork && !hasUnsettledTarget && !hasLiveProviderWork(liveSession)) return;
+    if (!projectionHasWork && !hasLiveProviderWork(liveSession)) {
+      if (
+        input.requestedBy === "user" &&
+        providerThread?.id === thread.id &&
+        observedRuntime.session === null &&
+        observedRuntime.lifecycleGeneration !== null &&
+        observedRuntime.inheritedLifecycleGeneration !== observedRuntime.lifecycleGeneration &&
+        (unfinishedStop === undefined || unfinishedStop.retiredLifecycleGeneration !== undefined)
+      ) {
+        // A failed local ownership attempt can rewind to an empty generation.
+        // Only a new explicit Stop for a durable ambiguous root Claude send
+        // may retire it; untouched inherited and ordinary idle Stops stay inert.
+        const blocker = yield* deliveryRepository.firstBlockingDeliveryForThread({
+          consumerName: PROVIDER_COMMAND_REACTOR_CONSUMER,
+          threadId: thread.id,
+        });
+        if (Option.isSome(blocker) && blocker.value.state === "uncertain") {
+          const source = yield* readOrchestrationEventAtSequence(blocker.value.eventSequence);
+          if (
+            source &&
+            isRecoverySendEvent(source) &&
+            source.payload.threadId === thread.id &&
+            (yield* readRecoverySendProvider(source, thread)) === "claudeAgent"
+          ) {
+            return yield* processThreadSessionStop({
+              threadId: thread.id,
+              createdAt: input.createdAt,
+              controlRequestId: input.controlRequestId,
+              expectedLifecycleGeneration: observedRuntime.lifecycleGeneration,
+              ...(thread.session ? { expectedSession: thread.session } : {}),
+            });
+          }
+        }
+      }
+      if (!hasUnsettledTarget) return;
+    }
 
     // The projection can lag a live turn. Only use session stop when neither
     // side owns a turn to interrupt, and retire the runtime rather than just
@@ -8494,24 +8575,6 @@ const make = Effect.gen(function* () {
       return true;
     });
 
-    // Replay and recovery must see the session other writers just persisted,
-    // even when its projection has not caught up yet.
-    const readLatestThreadSession = Effect.fnUntraced(function* (
-      threadId: ThreadId,
-      throughSequence?: number,
-    ) {
-      const highWater = throughSequence ?? (yield* orchestrationEngine.getEventHighWaterSequence);
-      return yield* orchestrationEngine
-        .readThreadEventsThrough(threadId, 0, highWater, ["thread.session-set"])
-        .pipe(
-          Stream.runFold(
-            () => null as OrchestrationSession | null,
-            (_latest, event) =>
-              event.type === "thread.session-set" ? event.payload.session : _latest,
-          ),
-        );
-    });
-
     // Root Claude recovery waits for verified Stop. Untouched inherited
     // delivery can be reconciled without claiming prior OS-process cleanup.
     // The final check and SQL mutation share the provider lifecycle lease.
@@ -8525,26 +8588,11 @@ const make = Effect.gen(function* () {
         return reconciliation;
       });
       return Effect.gen(function* () {
-        if (
-          event.type !== "thread.turn-start-requested" &&
-          event.type !== "thread.message-edit-resend-requested" &&
-          !(
-            event.type === "thread.claude-cache-response-requested" &&
-            event.payload.decision === "continue"
-          )
-        )
-          return yield* commit;
+        if (!isRecoverySendEvent(event)) return yield* commit;
         const refuse = (reason: "stop-required" | "stop-unconfirmed") =>
           Effect.fail(new ProviderDeliveryRecoveryError({ reason }));
         const thread = yield* resolveThreadShell(event.payload.threadId);
-        const priorSession = yield* readLatestThreadSession(event.payload.threadId, event.sequence);
-        const provider =
-          event.type === "thread.claude-cache-response-requested"
-            ? "claudeAgent"
-            : (event.payload.modelSelection?.provider ??
-              priorSession?.providerName ??
-              thread?.session?.providerName ??
-              thread?.modelSelection.provider);
+        const provider = yield* readRecoverySendProvider(event, thread);
         if (provider !== "claudeAgent") return yield* commit;
         const owner = yield* resolveProviderSessionThread(event.payload.threadId);
         // Child delivery keeps its existing explicit-abandon semantics. A root
@@ -9447,10 +9495,7 @@ const make = Effect.gen(function* () {
               const guardedSend =
                 input.outcome === "abandon" &&
                 delivery.value.state === "uncertain" &&
-                (reconciledEvent.type === "thread.turn-start-requested" ||
-                  reconciledEvent.type === "thread.message-edit-resend-requested" ||
-                  (reconciledEvent.type === "thread.claude-cache-response-requested" &&
-                    reconciledEvent.payload.decision === "continue"));
+                isRecoverySendEvent(reconciledEvent);
               const reconciled = yield* guardedSend
                 ? withClaudeSendRecoverySafe(reconciledEvent, reconciliation)
                 : reconciliation;
