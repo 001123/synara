@@ -3,7 +3,7 @@ title: Connectors
 description: Connect remote MCP tools to supported agent sessions, with sign-in and provider-specific limits.
 ---
 
-Connectors are available in **Synara Beta 1.0.6-beta.1** and the next Stable release built from current `main`. Open **Settings → Connectors**, select a catalog entry or a custom public HTTPS MCP URL, and complete any required sign-in in your browser. This lets an agent use another service's tools. [External MCP](/docs/workflows/external-mcp) works in the other direction, allowing outside agents to call Synara.
+Connectors are available in **Synara Beta 1.0.6-beta.1** and Stable 1.0.9 and later. Open **Settings → Connectors**, select a catalog entry or a custom public HTTPS MCP URL, and complete any required sign-in in your browser. This lets an agent use another service's tools. [External MCP](/docs/workflows/external-mcp) works in the other direction, allowing outside agents to call Synara.
 
 ## Start a connected session
 
@@ -32,3 +32,5 @@ Connector credentials stay in the server's local secret store and are not passed
 Stable and Beta use the same connector functionality, but keep their own credentials and data homes. Sign in separately in each app; Beta credentials are not copied into Stable. See [Synara Beta](/docs/features/synara-beta).
 
 Source evidence: feature head `4b2441d1040080324f458602e30fbb7f946cb1f5`; `docs/mcp-connectors.md`, `packages/shared/src/mcpConnectors.ts`, `apps/server/src/mcpConnectors/runtime.ts`, `apps/server/src/mcpConnectors/proxy.ts`, `apps/server/src/agentGateway/mcpInjection.ts` and `apps/web/src/components/settings/McpConnectorsSettingsPanel.tsx`.
+
+Source evidence for 1.0.9: Synara release `ebd0d22b39ce3a0f7c6051dddc6090e9b85dc7c3`; `docs/releases/1.0.9-source-audit.md`, `docs/providers.md`, `docs/core-concepts.md`, `docs/editor/intelligence.md`, `docs/mcp-connectors.md`, `apps/server/src/persistence/MigrationBackup.ts` and `docs/release.md`.
