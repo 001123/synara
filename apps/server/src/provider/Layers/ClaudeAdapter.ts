@@ -1100,8 +1100,8 @@ function readClaudeModelRefusalFallback(message: unknown): ClaudeModelRefusalFal
   };
 }
 
-// VCS state transitions (commit, checkout, rebase) stream as an untyped system
-// message; match structurally so SDK type drift stays inert.
+// VCS transitions and publication notices arrive as untyped system messages;
+// match structurally so SDK type drift stays inert.
 interface ClaudeVcsStateChange {
   readonly kind?: string;
   readonly cwd?: string;
@@ -1117,7 +1117,15 @@ function readClaudeVcsStateChange(message: unknown): ClaudeVcsStateChange | unde
     kind?: unknown;
     cwd?: unknown;
   };
-  if (record.type !== "system" || record.subtype !== "vcs_state_changed") {
+  if (record.type !== "system") {
+    return undefined;
+  }
+  if (record.subtype === "code_change_published") {
+    // The SDK does not model this notice. Invalidate only; the owned workspace
+    // supplies authoritative branch and PR data instead of the publication payload.
+    return { kind: "code_change_published" };
+  }
+  if (record.subtype !== "vcs_state_changed") {
     return undefined;
   }
   const kind = readNonEmptyString(record.kind);
