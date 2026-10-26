@@ -98,3 +98,84 @@ export function splitDroppedComposerFiles(input: {
 
   return { pathMentions, imageFiles, genericFiles };
 }
+
+// Editor file trees (VS Code, Cursor, …) attach real `Files` only when dragging
+// files; a dragged folder carries just its path, as `codefiles` (a JSON array of
+// absolute paths) and/or a `text/uri-list` of `file://` URLs.
+const CODE_FILES_DRAG_TYPE = "codefiles";
+const URI_LIST_DRAG_TYPE = "text/uri-list";
+
+/** Drag types that may carry absolute paths without `Files` (readable only on drop). */
+export function hasDroppedPathReferenceTypes(types: readonly string[]): boolean {
+  if (types.includes("Files")) {
+    return false;
+  }
+  if (typeof window === "undefined" || !window.desktopBridge) {
+    return false;
+  }
+  return types.includes(CODE_FILES_DRAG_TYPE) || types.includes(URI_LIST_DRAG_TYPE);
+}
+
+function fileUrlToAbsolutePath(value: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "file:") {
+    return null;
+  }
+  let path: string;
+  try {
+    path = decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+  // `file:///C:/dir` → `C:/dir` on Windows.
+  if (/^\/[A-Za-z]:\//.test(path)) {
+    path = path.slice(1);
+  }
+  if (url.host && url.host !== "localhost") {
+    path = `//${url.host}${path}`;
+  }
+  return path.length > 0 ? path : null;
+}
+
+function readCodeFilesPaths(raw: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(
+      (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Absolute paths from an editor drag that has no `Files`; empty when there are none. */
+export function readDroppedPathReferences(
+  dataTransfer: Pick<DataTransfer, "types" | "getData">,
+): string[] {
+  const types = Array.from(dataTransfer.types);
+  if (!hasDroppedPathReferenceTypes(types)) {
+    return [];
+  }
+  let paths: string[] = [];
+  if (types.includes(CODE_FILES_DRAG_TYPE)) {
+    paths = readCodeFilesPaths(dataTransfer.getData(CODE_FILES_DRAG_TYPE));
+  }
+  if (paths.length === 0 && types.includes(URI_LIST_DRAG_TYPE)) {
+    paths = dataTransfer
+      .getData(URI_LIST_DRAG_TYPE)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#"))
+      .map(fileUrlToAbsolutePath)
+      .filter((path): path is string => path !== null);
+  }
+  return Array.from(new Set(paths));
+}

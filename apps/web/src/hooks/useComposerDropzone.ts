@@ -6,7 +6,12 @@
 import { useEffect, useRef, type ClipboardEvent, type DragEvent } from "react";
 
 import { CHAT_FILE_REFERENCE_DRAG_TYPE } from "~/lib/chatReferences";
-import { isDroppedComposerDirectory, splitDroppedComposerFiles } from "~/lib/composerDropPaths";
+import {
+  hasDroppedPathReferenceTypes,
+  isDroppedComposerDirectory,
+  readDroppedPathReferences,
+  splitDroppedComposerFiles,
+} from "~/lib/composerDropPaths";
 
 export interface ComposerDropzoneFileSplit {
   readonly imageFiles: File[];
@@ -68,7 +73,12 @@ export function shouldBlockDisabledComposerDropzoneTransfer(
   disabled: boolean,
   types: readonly string[],
 ): boolean {
-  return disabled && (types.includes(CHAT_FILE_REFERENCE_DRAG_TYPE) || types.includes("Files"));
+  return (
+    disabled &&
+    (types.includes(CHAT_FILE_REFERENCE_DRAG_TYPE) ||
+      types.includes("Files") ||
+      hasDroppedPathReferenceTypes(types))
+  );
 }
 
 function shouldResetComposerDropzoneAfterUnhandledFileDrop(
@@ -118,6 +128,9 @@ function isComposerHandledDragForMode(
   genericFiles: ComposerDropzoneGenericFileMode,
 ): boolean {
   if (dataTransfer.types.includes(CHAT_FILE_REFERENCE_DRAG_TYPE)) {
+    return true;
+  }
+  if (hasDroppedPathReferenceTypes(Array.from(dataTransfer.types))) {
     return true;
   }
   if (!dataTransfer.types.includes("Files")) {
@@ -259,6 +272,15 @@ export function useComposerDropzone(input: {
       return;
     }
     if (!event.dataTransfer.types.includes("Files")) {
+      // Folders dragged from an editor file tree arrive as paths, not Files.
+      const referencedPaths = readDroppedPathReferences(event.dataTransfer);
+      resetComposerDragState();
+      if (referencedPaths.length === 0 || !appendPathMentions) {
+        return;
+      }
+      event.preventDefault();
+      appendPathMentions(referencedPaths);
+      focusComposer?.();
       return;
     }
     // Desktop OS drops: resolve absolute paths so folders become @mentions

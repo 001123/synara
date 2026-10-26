@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  hasDroppedPathReferenceTypes,
   isDroppedComposerDirectory,
+  readDroppedPathReferences,
   resolveDroppedFileAbsolutePath,
   splitDroppedComposerFiles,
   type ComposerDroppedFileItem,
@@ -100,6 +102,66 @@ describe("composerDropPaths", () => {
       pathMentions: [],
       imageFiles: [],
       genericFiles: [emptyFile],
+    });
+  });
+
+  describe("editor path-reference drags", () => {
+    const transfer = (data: Record<string, string>) => ({
+      types: Object.keys(data),
+      getData: (type: string) => data[type] ?? "",
+    });
+
+    it("ignores path-reference drags outside the desktop app", () => {
+      vi.stubGlobal("window", {});
+
+      expect(hasDroppedPathReferenceTypes(["text/uri-list"])).toBe(false);
+      expect(
+        readDroppedPathReferences(transfer({ "text/uri-list": "file:///Users/me/a" })),
+      ).toEqual([]);
+    });
+
+    it("leaves real file drops to the Files path", () => {
+      vi.stubGlobal("window", { desktopBridge: {} });
+
+      expect(hasDroppedPathReferenceTypes(["Files", "text/uri-list"])).toBe(false);
+    });
+
+    it("reads folder paths from codefiles before the uri list", () => {
+      vi.stubGlobal("window", { desktopBridge: {} });
+
+      expect(
+        readDroppedPathReferences(
+          transfer({
+            codefiles: JSON.stringify(["/Users/me/repo/.codex", "/Users/me/repo/.codex"]),
+            "text/uri-list": "file:///ignored",
+          }),
+        ),
+      ).toEqual(["/Users/me/repo/.codex"]);
+    });
+
+    it("decodes file URLs from a uri list and skips other schemes", () => {
+      vi.stubGlobal("window", { desktopBridge: {} });
+
+      expect(
+        readDroppedPathReferences(
+          transfer({
+            "text/uri-list": [
+              "# comment",
+              "file:///Users/me/My%20Repo/src",
+              "https://example.com/page",
+              "file:///C:/work/app",
+            ].join("\r\n"),
+          }),
+        ),
+      ).toEqual(["/Users/me/My Repo/src", "C:/work/app"]);
+    });
+
+    it("returns nothing for a web link drag", () => {
+      vi.stubGlobal("window", { desktopBridge: {} });
+
+      expect(
+        readDroppedPathReferences(transfer({ "text/uri-list": "https://example.com" })),
+      ).toEqual([]);
     });
   });
 });
