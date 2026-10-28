@@ -3,6 +3,8 @@
 //          when a drop should become a path mention instead of a byte attachment.
 // Layer: Web composer utility (desktop-aware)
 
+import { isLocalAbsolutePath, localPathsEqual } from "@synara/shared/path";
+
 export interface ComposerDroppedFileItem {
   readonly kind: string;
   readonly getAsFile: () => File | null;
@@ -56,6 +58,7 @@ function getDroppedItemFile(item: ComposerDroppedFileItem | undefined): File | n
 export function splitDroppedComposerFiles(input: {
   readonly files: Iterable<File>;
   readonly items?: Iterable<ComposerDroppedFileItem>;
+  readonly referencedPaths?: readonly string[];
 }): {
   readonly pathMentions: string[];
   readonly imageFiles: File[];
@@ -69,6 +72,8 @@ export function splitDroppedComposerFiles(input: {
   const imageFiles: File[] = [];
   const genericFiles: File[] = [];
   const seenPaths = new Set<string>();
+  const representedPaths: string[] = [];
+  let canMatchReferencedPaths = true;
   const itemCount = Math.max(fallbackFiles.length, fileItems.length);
 
   for (let index = 0; index < itemCount; index += 1) {
@@ -78,15 +83,19 @@ export function splitDroppedComposerFiles(input: {
       continue;
     }
 
-    if (isDroppedComposerDirectory(item)) {
-      const absolutePath = resolveDroppedFileAbsolutePath(file);
-      if (absolutePath) {
-        if (!seenPaths.has(absolutePath)) {
-          seenPaths.add(absolutePath);
-          pathMentions.push(absolutePath);
-        }
-        continue;
+    const isDirectory = isDroppedComposerDirectory(item);
+    const absolutePath =
+      isDirectory || input.referencedPaths?.length ? resolveDroppedFileAbsolutePath(file) : null;
+    if (input.referencedPaths?.length) {
+      if (absolutePath) representedPaths.push(absolutePath);
+      else canMatchReferencedPaths = false;
+    }
+    if (isDirectory && absolutePath) {
+      if (!seenPaths.has(absolutePath)) {
+        seenPaths.add(absolutePath);
+        pathMentions.push(absolutePath);
       }
+      continue;
     }
 
     if (file.type.startsWith("image/")) {
@@ -96,20 +105,28 @@ export function splitDroppedComposerFiles(input: {
     }
   }
 
+  // Editor payloads include both folders and attached files. If a File has no
+  // native path, keep its attachment semantics rather than guessing its identity.
+  if (canMatchReferencedPaths) {
+    for (const path of input.referencedPaths ?? []) {
+      if (!representedPaths.some((represented) => localPathsEqual(represented, path))) {
+        representedPaths.push(path);
+        pathMentions.push(path);
+      }
+    }
+  }
+
   return { pathMentions, imageFiles, genericFiles };
 }
 
 // Editor file trees (VS Code, Cursor, …) attach real `Files` only when dragging
 // files; a dragged folder carries just its path, as `codefiles` (a JSON array of
 // absolute paths) and/or a `text/uri-list` of `file://` URLs.
-const CODE_FILES_DRAG_TYPE = "codefiles";
+export const CODE_FILES_DRAG_TYPE = "codefiles";
 const URI_LIST_DRAG_TYPE = "text/uri-list";
 
-/** Drag types that may carry absolute paths without `Files` (readable only on drop). */
+/** Desktop drag types that may carry paths, including folders alongside `Files`. */
 export function hasDroppedPathReferenceTypes(types: readonly string[]): boolean {
-  if (types.includes("Files")) {
-    return false;
-  }
   if (typeof window === "undefined" || !window.desktopBridge) {
     return false;
   }
@@ -139,7 +156,7 @@ function fileUrlToAbsolutePath(value: string): string | null {
   if (url.host && url.host !== "localhost") {
     path = `//${url.host}${path}`;
   }
-  return path.length > 0 ? path : null;
+  return isLocalAbsolutePath(path) && !path.includes("\0") ? path : null;
 }
 
 function readCodeFilesPaths(raw: string): string[] {
@@ -149,14 +166,15 @@ function readCodeFilesPaths(raw: string): string[] {
       return [];
     }
     return parsed.filter(
-      (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+      (entry): entry is string =>
+        typeof entry === "string" && isLocalAbsolutePath(entry) && !entry.includes("\0"),
     );
   } catch {
     return [];
   }
 }
 
-/** Absolute paths from an editor drag that has no `Files`; empty when there are none. */
+/** Local absolute paths from an editor drag, including mixed native File payloads. */
 export function readDroppedPathReferences(
   dataTransfer: Pick<DataTransfer, "types" | "getData">,
 ): string[] {
